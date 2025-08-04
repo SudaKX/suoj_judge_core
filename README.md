@@ -45,6 +45,11 @@ cat /sys/fs/cgroup/cgroup.controllers
 ### 权限要求
 
 ```bash
+
+chmod +x run.sh
+chmod +x judge_cgroup.sh
+chmod +x judge_core_cgroup.cpp
+
 # 需要使用sudo运行
 sudo ./judge_cgroup.sh limits.json test.cpp test.in
 ```

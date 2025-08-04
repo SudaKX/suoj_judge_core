@@ -64,7 +64,7 @@ RESULT_FILE="result_cgroup_$(date +%Y%m%d_%H%M%S).json"
 echo ""
 echo "评测完成，结果已保存到: $RESULT_FILE"
 
-清理编译产生的文件
+# 清理编译产生的文件
 rm -f judge_core_cgroup
 
 echo "评测核心已清理完毕"
