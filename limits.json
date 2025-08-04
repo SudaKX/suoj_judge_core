@@ -1,0 +1,7 @@
+{
+  "time_limit": 9000,
+  "memory_limit": 10240,
+  "output_limit": 64000000,
+  "compile_timeout": 30000,
+  "stack_limit": 8192
+}
