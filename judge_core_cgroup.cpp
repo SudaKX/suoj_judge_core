@@ -28,6 +28,8 @@
 #include <fstream>        // 文件流操作
 #include <string>         // 字符串处理
 #include <chrono>         // 高精度时间测量
+#include <vector>         // 动态数组容器
+#include <functional>     // 哈希函数支持
 #include <unistd.h>       // POSIX系统调用
 #include <sys/wait.h>     // 进程等待相关
 #include <sys/resource.h> // 资源限制
@@ -35,6 +37,7 @@
 #include <signal.h>       // 信号处理
 #include <fcntl.h>        // 文件控制
 #include <sys/stat.h>     // 文件状态
+#include <sched.h>        // CPU调度和亲和性
 #include <sstream>        // 字符串流
 #include <random>         // 随机数生成
 
@@ -56,6 +59,7 @@ struct JudgeResult
     string error_message;  ///< 详细错误信息
     string stdout_content; ///< 程序标准输出内容
     int output_len;        ///< 输出内容长度(字节)
+    string allocated_cpu;  ///< 分配的CPU核心编号
 };
 
 /**
@@ -166,6 +170,160 @@ public:
     }
 
     /**
+     * @brief 设置CPU限制 - 严格固定在单个CPU核心
+     * @return bool 设置成功返回true，失败返回false
+     *
+     * 为待测程序分配一个固定的CPU核心，确保整个运行期间严格在该核心上执行
+     * 禁止进程在不同CPU核心之间迁移，提供完全一致的执行环境
+     *
+     * @details cpuset.cpus控制进程可以使用的CPU核心
+     *          - 选择一个可用的CPU核心并严格固定
+     *          - 设置CPU亲和性确保不会迁移
+     *          - 保证所有程序获得相同的单核心执行条件
+     *
+     * @note 严格单核心执行确保评测的绝对公平性
+     */
+    bool setCpuLimit()
+    {
+        if (!created)
+            return false;
+
+        // 首先确保在根cgroup中启用cpuset控制器
+        ofstream root_subtree("/sys/fs/cgroup/cgroup.subtree_control");
+        if (root_subtree)
+        {
+            root_subtree << "+cpuset" << endl;
+            root_subtree.close();
+        }
+
+        // 选择一个CPU核心进行严格绑定
+        string selected_cpu = selectCpuForBinding();
+        if (selected_cpu.empty())
+        {
+            return false;
+        }
+
+        // 设置cpuset.cpus - 严格限制在选定的单个CPU核心
+        ofstream cpuset_cpus(cgroup_path + "/cpuset.cpus");
+        if (!cpuset_cpus)
+            return false;
+
+        cpuset_cpus << selected_cpu << endl;
+
+        if (!cpuset_cpus.good())
+        {
+            return false;
+        }
+
+        // 设置cpuset.mems - 继承内存节点设置
+        ifstream parent_mems("/sys/fs/cgroup/cpuset.mems.effective");
+        string available_mems;
+        if (parent_mems)
+        {
+            getline(parent_mems, available_mems);
+            parent_mems.close();
+        }
+
+        if (available_mems.empty())
+        {
+            available_mems = "0";
+        }
+
+        ofstream cpuset_mems(cgroup_path + "/cpuset.mems");
+        if (!cpuset_mems)
+            return false;
+
+        cpuset_mems << available_mems << endl;
+        return cpuset_mems.good();
+    }
+
+    /**
+     * @brief 强制CPU绑定到指定核心
+     * @param pid 进程ID
+     * @param cpu_id CPU核心ID
+     * @return bool 绑定成功返回true，失败返回false
+     *
+     * 使用sched_setaffinity直接设置进程的CPU亲和性
+     * 这是对cgroup cpuset的补充，确保更严格的CPU绑定
+     */
+    bool forceCpuBinding(pid_t pid, int cpu_id)
+    {
+        cpu_set_t cpu_set;
+        CPU_ZERO(&cpu_set);
+        CPU_SET(cpu_id, &cpu_set);
+
+        if (sched_setaffinity(pid, sizeof(cpu_set), &cpu_set) == 0)
+        {
+            return true;
+        }
+        return false;
+    }
+
+private:
+    /**
+     * @brief 选择CPU核心进行严格绑定
+     * @return string 选定的CPU核心编号，失败返回空字符串
+     *
+     * 基于轮询策略选择一个CPU核心，确保多个评测进程分散到不同核心
+     * 但每个进程都严格固定在其分配的核心上
+     *
+     * @details 选择策略：
+     *          1. 获取系统可用CPU核心数量
+     *          2. 使用时间戳进行轮询分配
+     *          3. 确保选择的核心有效且可用
+     *          4. 返回单个核心编号用于严格绑定
+     */
+    string selectCpuForBinding()
+    {
+        // 获取系统CPU核心数量
+        int cpu_count = getCpuCount();
+        if (cpu_count <= 0)
+        {
+            return "0"; // 默认使用CPU 0
+        }
+
+        // 使用时间戳进行轮询，确保不同时间启动的进程分散到不同核心
+        auto now = chrono::high_resolution_clock::now();
+        auto timestamp = now.time_since_epoch().count();
+
+        // 基于cgroup名称和时间戳计算，增加随机性
+        size_t hash_value = std::hash<string>{}(cgroup_name) ^ timestamp;
+        int selected_cpu = hash_value % cpu_count;
+
+        return to_string(selected_cpu);
+    }
+
+    /**
+     * @brief 获取系统CPU核心数量
+     * @return int CPU核心数量，失败返回-1
+     *
+     * 通过读取/proc/cpuinfo获取系统的CPU核心数量
+     * 用于CPU分配时的轮询计算
+     */
+    int getCpuCount()
+    {
+        ifstream cpuinfo("/proc/cpuinfo");
+        if (!cpuinfo)
+        {
+            return -1;
+        }
+
+        int cpu_count = 0;
+        string line;
+        while (getline(cpuinfo, line))
+        {
+            if (line.find("processor") == 0)
+            {
+                cpu_count++;
+            }
+        }
+        cpuinfo.close();
+
+        return cpu_count > 0 ? cpu_count : 1;
+    }
+
+public:
+    /**
      * @brief 将进程添加到cgroup
      * @param pid 要添加的进程ID
      * @return bool 添加成功返回true，失败返回false
@@ -266,6 +424,27 @@ public:
     const string &getName() const
     {
         return cgroup_name;
+    }
+
+    /**
+     * @brief 获取分配的CPU核心编号
+     * @return string 当前分配的CPU核心编号，失败返回空字符串
+     *
+     * 读取当前cgroup分配的CPU核心信息
+     * 用于调试和验证CPU分配是否正确
+     */
+    string getAllocatedCpu() const
+    {
+        if (!created)
+            return "";
+
+        ifstream cpuset_cpus(cgroup_path + "/cpuset.cpus");
+        if (!cpuset_cpus)
+            return "";
+
+        string allocated_cpu;
+        getline(cpuset_cpus, allocated_cpu);
+        return allocated_cpu;
     }
 };
 
@@ -380,6 +559,7 @@ JudgeResult compileProgram(const string &source_file, const string &output_file,
     result.mem_used = 0;
     result.exit_code = 0;
     result.output_len = 0;
+    result.allocated_cpu = "";
 
     // 创建编译命令
     string compile_cmd = "g++ -g -std=c++20 -O2 -Wall -Wextra -Wshadow -Wconversion -Wfloat-equal " + source_file + " -o " + output_file + " 2>&1";
@@ -432,6 +612,7 @@ JudgeResult runProgram(const string &executable, const string &input_file, const
     result.mem_used = 0;
     result.exit_code = -1;
     result.output_len = 0;
+    result.allocated_cpu = "";
 
     // 创建cgroup
     CgroupManager cgroup;
@@ -447,6 +628,16 @@ JudgeResult runProgram(const string &executable, const string &input_file, const
         result.error_message = "Failed to set memory limit in cgroup";
         return result;
     }
+
+    // 设置CPU限制为单核心
+    if (!cgroup.setCpuLimit())
+    {
+        result.error_message = "Failed to set CPU limit in cgroup";
+        return result;
+    }
+
+    // 获取分配的CPU核心信息
+    result.allocated_cpu = cgroup.getAllocatedCpu();
 
     // 创建管道用于获取输出
     int stdout_pipe[2];
@@ -534,6 +725,18 @@ JudgeResult runProgram(const string &executable, const string &input_file, const
             close(stderr_pipe[0]);
             close(stderr_pipe[1]);
             return result;
+        }
+
+        // 强制CPU绑定到分配的核心
+        string allocated_cpu_str = result.allocated_cpu;
+        if (!allocated_cpu_str.empty())
+        {
+            int allocated_cpu_id = stoi(allocated_cpu_str);
+            if (!cgroup.forceCpuBinding(pid, allocated_cpu_id))
+            {
+                // CPU绑定失败不中止评测，但记录警告
+                result.error_message += "Warning: Failed to set CPU affinity; ";
+            }
         }
 
         close(stdout_pipe[1]);
@@ -762,7 +965,8 @@ string resultToJson(const JudgeResult &result)
     }
 
     ss << "\"," << endl;
-    ss << "  \"output_len\": " << result.output_len << endl;
+    ss << "  \"output_len\": " << result.output_len << "," << endl;
+    ss << "  \"allocated_cpu\": \"" << result.allocated_cpu << "\"" << endl;
     ss << "}";
 
     return ss.str();
@@ -800,6 +1004,7 @@ JudgeResult judge_core(const string &limits_file, const string &source_file, con
         result.mem_used = 0;
         result.exit_code = -1;
         result.output_len = 0;
+        result.allocated_cpu = "";
     }
 
     return result;

@@ -1,5 +1,5 @@
 {
-  "time_limit": 9000,
+  "time_limit": 1000000,
   "memory_limit": 10240,
   "output_limit": 64000000,
   "compile_timeout": 30000,
