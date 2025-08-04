@@ -48,7 +48,9 @@ cat /sys/fs/cgroup/cgroup.controllers
 
 chmod +x run.sh
 chmod +x judge_cgroup.sh
-chmod +x judge_core_cgroup.cpp
+
+# there seems no need to change permissions
+# chmod +x judge_core_cgroup.cpp
 
 # 需要使用sudo运行
 sudo ./judge_cgroup.sh limits.json test.cpp test.in

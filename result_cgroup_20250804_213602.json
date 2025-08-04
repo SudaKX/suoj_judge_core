@@ -1,9 +1,0 @@
-{
-  "status": "OK",
-  "time_used": 10,
-  "mem_used": 3624960,
-  "exit_code": 0,
-  "error_message": "",
-  "stdout": "Hello, World!\n",
-  "output_len": 14
-}
